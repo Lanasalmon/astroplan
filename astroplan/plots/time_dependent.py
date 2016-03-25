@@ -11,7 +11,7 @@ import warnings
 from ..exceptions import PlotWarning
 from ..utils import _set_mpl_style_sheet
 
-__all__ = ['plot_airmass', 'plot_parallactic']
+__all__ = ['plot_airmass', 'plot_altitude', 'plot_parallactic']
 
 
 def _secz_to_altitude(secant_z):
@@ -142,7 +142,7 @@ def plot_airmass(target, observer, time, ax=None, style_kwargs=None,
 
     # Calculate airmass
     airmass = observer.altaz(time, target).secz
-    # Mask out nonsense airmasses
+    # Mask out nonsense airmasses (when below horizon)
     masked_airmass = np.ma.array(airmass, mask=airmass < 1)
 
     # Some checks & info for labels.
@@ -195,6 +195,157 @@ def plot_airmass(target, observer, time, ax=None, style_kwargs=None,
         ax2.set_yticklabels(altitude_ticks)
         ax2.set_ylim(ax.get_ylim())
         ax2.set_ylabel('Altitude [degrees]')
+
+    # Redraw figure for interactive sessions.
+    ax.figure.canvas.draw()
+
+    # Output.
+    return ax
+
+
+
+def plot_altitude(target, observer, time, ax=None, style_kwargs=None,
+                  style_sheet=None):
+    """
+    Plots altitude as a function of time for a given target.
+
+    If a `~matplotlib.axes.Axes` object already exists, an additional
+    airmass plot will be "stacked" on it.  Otherwise, creates a new
+    `~matplotlib.axes.Axes` object and plots airmass on top of that.
+
+    When a scalar `~astropy.time.Time` object is passed in (e.g.,
+    ``Time('2000-1-1')``), the resulting plot will use a 24-hour window
+    centered on the time indicated, with airmass sampled at regular
+    intervals throughout.
+    However, the user can control the exact number and frequency of airmass
+    calculations used by passing in a non-scalar `~astropy.time.Time`
+    object. For instance, ``Time(['2000-1-1 23:00:00', '2000-1-1
+    23:30:00'])`` will result in a plot with only two airmass measurements.
+
+    Parameters
+    ----------
+    target : `~astroplan.FixedTarget`
+        The celestial body of interest.
+
+    observer : `~astroplan.Observer`
+        The person, telescope, observatory, etc. doing the observing.
+
+    time : `~astropy.time.Time`
+        If scalar (e.g., ``Time('2000-1-1')``), will result in plotting target
+        airmasses once an hour over a 24-hour window.
+        If non-scalar (e.g., ``Time(['2000-1-1'])``, ``[Time('2000-1-1')]``,
+        ``Time(['2000-1-1', '2000-1-2'])``),
+        will result in plotting data at the exact times specified.
+
+    ax : `~matplotlib.axes.Axes` or None, optional.
+        The `~matplotlib.axes.Axes` object to be drawn on.
+        If None, uses the current ``Axes``.
+
+    style_kwargs : dict or None, optional.
+        A dictionary of keywords passed into `~matplotlib.pyplot.plot_date`
+        to set plotting styles.
+
+    style_sheet : dict or `None` (optional)
+        matplotlib style sheet to use. To see available style sheets in
+        astroplan, print *astroplan.plots.available_style_sheets*. Defaults
+        to the light theme.
+
+
+    Returns
+    -------
+    ax : `~matplotlib.axes.Axes`
+        An ``Axes`` object with added airmass vs. time plot.
+
+    Notes
+    -----
+    y-axis shows altitudes between 0 and 90 degrees by default.
+    If user wishes to change these, use ``ax.\<set attribute\>`` before drawing
+    or saving plot:
+    """
+    # Import matplotlib, set style sheet
+    if style_sheet is not None:
+        _set_mpl_style_sheet(style_sheet)
+
+    import matplotlib.pyplot as plt
+    from matplotlib import dates
+
+    # Set up plot axes and style if needed.
+    if ax is None:
+        ax = plt.gca()
+    if style_kwargs is None:
+        style_kwargs = {}
+    style_kwargs = dict(style_kwargs)
+    style_kwargs.setdefault('linestyle', '-')
+    style_kwargs.setdefault('fmt', '-')
+
+    # Populate time window if needed.
+    time = Time(time)
+    midnight = observer.midnight(time)
+    if time.isscalar:
+        time = time + np.linspace(-11.999, +11.999, 100)*u.hour
+    elif len(time) == 1:
+        warnings.warn('You used a Time array of length 1.  You probably meant '
+                      'to use a scalar. (Or maybe a list with length > 1?).',
+                      PlotWarning)
+
+    # Calculate airmass
+    altaz = observer.altaz(time, target)
+    airmass = altaz.secz
+
+    # Some checks & info for labels.
+    if not hasattr(target, 'name'):
+        target_name = ''
+    else:
+        target_name = target.name
+    style_kwargs.setdefault('label', target_name)
+
+    # Plot data.
+    ax.plot_date(time.plot_date, altaz.alt.deg, **style_kwargs)
+
+    # Format the time axis
+    date_formatter = dates.DateFormatter('%H')
+    ax.xaxis.set_major_formatter(date_formatter)
+    ax.xaxis.set_major_locator(dates.HourLocator())
+
+    # Shade background during night time
+    """
+    for test_time in [time[0], time[-1]]:
+        midnight = observer.midnight(test_time)
+        previous_sunset = observer.sun_set_time(midnight, which='previous')
+        next_sunrise = observer.sun_rise_time(midnight, which='next')
+        previous_twilight = observer.twilight_evening_astronomical(midnight, which='previous')
+        next_twilight = observer.twilight_morning_astronomical(midnight, which='next')
+    """
+    previous_sunset = observer.sun_set_time(midnight, which='previous')
+    next_sunrise = observer.sun_rise_time(midnight, which='next')
+    previous_twilight = observer.twilight_evening_astronomical(midnight, which='previous')
+    next_twilight = observer.twilight_morning_astronomical(midnight, which='next')
+
+    ax.axvspan(previous_sunset.plot_date, next_sunrise.plot_date,
+               facecolor='k', alpha=0.05)
+    ax.axvspan(previous_twilight.plot_date, next_twilight.plot_date,
+               facecolor='k', alpha=0.05)
+
+    ax.set_ylim([0, 90])
+    altitude_ticks = np.array([0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+    ax.set_yticks(altitude_ticks)
+    ax.set_xlim([previous_sunset.plot_date, next_sunrise.plot_date])
+
+    # Set labels.
+    ax.set_ylabel("Altitude")
+    ax.set_xlabel("Universal Time, starting {0}".format(min(time).datetime.date()))
+
+    if not _has_twin(ax):
+        airmass_altitude_ticks = np.array([19.5, 30, 40, 50, 60, 70, 80, 90])
+        airmass_labels = 1. / np.cos(np.radians(90 - airmass_altitude_ticks))
+        airmass_labels = ["{:.2f}".format(label) for label in airmass_labels]
+
+        ax2 = ax.twinx()
+        ax2.invert_yaxis()
+        ax2.set_yticks(airmass_altitude_ticks)
+        ax2.set_yticklabels(airmass_labels)
+        ax2.set_ylim(ax.get_ylim())
+        ax2.set_ylabel('Airmass')
 
     # Redraw figure for interactive sessions.
     ax.figure.canvas.draw()
@@ -277,7 +428,7 @@ def plot_parallactic(target, observer, time, ax=None, style_kwargs=None,
     # Populate time window if needed.
     time = Time(time)
     if time.isscalar:
-        time = time + np.linspace(-12, 12, 100)*u.hour
+        time = time + np.linspace(-11.999, +11.999, 100)*u.hour
     elif len(time) == 1:
         warnings.warn('You used a Time array of length 1.  You probably meant '
                       'to use a scalar. (Or maybe a list with length > 1?).',
