@@ -11,8 +11,7 @@ from astropy.utils.data import download_file, clear_download_cache
 from astropy.utils import iers
 from astropy.time import Time
 import astropy.units as u
-from astropy.utils.data import (_get_download_cache_locs, CacheMissingWarning,
-                                _open_shelve)
+from astropy.utils.data import _get_download_cache_locs, CacheMissingWarning
 
 # Package
 from .exceptions import OldEarthOrientationDataWarning
@@ -69,7 +68,7 @@ def IERS_A_in_cache():
         estr = '' if len(e.args) < 1 else (': ' + str(e))
         warnings.warn(CacheMissingWarning(msg + e.__class__.__name__ + estr))
         return False
-    with _open_shelve(urlmapfn, True) as url2hash:
+    with _open_shelve(urlmapfn, False) as url2hash:
         # TODO: try to figure out how to test this in the unicode case
         if str(url_key) in url2hash:
             return True
@@ -196,4 +195,22 @@ def _set_mpl_style_sheet(style_sheet):
     import matplotlib
     matplotlib.rcdefaults()
     matplotlib.rcParams.update(style_sheet)
+    
+def _open_shelve(shelffn, withclosing=False):
+    """
+    Opens a shelf file.  If ``withclosing`` is True, it will be opened with
+    closing, allowing use like:
+        with _open_shelve('somefile',True) as s:
+            ...
+    This workaround can be removed in favour of using shelve.open() directly
+    once support for Python <3.4 is dropped.
+    """
+    import shelve
+    import contextlib
 
+    shelf = shelve.open(shelffn, protocol=2)
+
+    if withclosing:
+        return contextlib.closing(shelf)
+    else:
+        return shelf
