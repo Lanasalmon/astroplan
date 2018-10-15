@@ -8,8 +8,7 @@ import warnings
 
 # Third-party
 from astropy.coordinates import (EarthLocation, SkyCoord, AltAz, get_sun,
-                                 Angle, Latitude, Longitude,
-                                 UnitSphericalRepresentation)
+                                 get_moon, Angle, Longitude)
 from astropy.extern.six import string_types
 import astropy.units as u
 from astropy.time import Time
@@ -18,13 +17,11 @@ import pytz
 
 # Package
 from .exceptions import TargetNeverUpWarning, TargetAlwaysUpWarning
-from .sites import get_site
 from .moon import moon_illumination, moon_phase_angle
+from .target import get_skycoord, SpecialObjectFlag, SunFlag, MoonFlag
+
 
 __all__ = ["Observer", "MAGIC_TIME"]
-
-# TODO: remove this statement once the moon is implemented without pyephem
-__doctest_requires__ = {'Observer.moon_altaz': ['ephem']}
 
 MAGIC_TIME = Time(-999, format='jd')
 
@@ -32,29 +29,22 @@ MAGIC_TIME = Time(-999, format='jd')
 def _generate_24hr_grid(t0, start, end, N, for_deriv=False):
     """
     Generate a nearly linearly spaced grid of time durations.
-
     The midpoints of these grid points will span times from ``t0``+``start``
     to ``t0``+``end``, including the end points, which is useful when taking
     numerical derivatives.
-
     Parameters
     ----------
     t0 : `~astropy.time.Time`
         Time queried for, grid will be built from or up to this time.
-
     start : float
         Number of days before/after ``t0`` to start the grid.
-
     end : float
         Number of days before/after ``t0`` to end the grid.
-
     N : int
         Number of grid points to generate
-
     for_deriv : bool
         Generate time series for taking numerical derivative (modify
         bounds)?
-
     Returns
     -------
     `~astropy.time.Time`
@@ -67,48 +57,44 @@ def _generate_24hr_grid(t0, start, end, N, for_deriv=False):
     else:
         time_grid = np.linspace(start, end, N)*u.day
 
+    # broadcast so grid is first index, and remaining shape of t0
+    # falls in later indices. e.g. if t0 is shape (10), time_grid
+    # will be shape (N, 10). If t0 is shape (5, 2), time_grid is (N, 5, 2)
+    while time_grid.ndim <= t0.ndim:
+        time_grid = time_grid[:, np.newaxis]
+    # we want to avoid 1D grids since we always want to broadcast against targets
+    if time_grid.ndim == 1:
+        time_grid = time_grid[:, np.newaxis]
     return t0 + time_grid
 
-def _target_is_vector(target):
-    if hasattr(target, '__iter__'):
-        return True
-    else:
-        return False
 
 class Observer(object):
+
     """
     A container class for information about an observer's location and
     environment.
-
     Examples
     --------
     We can create an observer at Subaru Observatory in Hawaii two ways. First,
     locations for some observatories are stored in astroplan, and these can be
     accessed by name, like so:
-
     >>> from astroplan import Observer
     >>> subaru = Observer.at_site("Subaru", timezone="US/Hawaii")
-
     To find out which observatories can be accessed by name, check out
-    `~astroplan.get_site_names`.
-
+    `~astropy.coordinates.EarthLocation.get_site_names`.
     Next, you can initialize an observer by specifying the location with
     `~astropy.coordinates.EarthLocation`:
-
     >>> from astropy.coordinates import EarthLocation
     >>> import astropy.units as u
     >>> location = EarthLocation.from_geodetic(-155.4761*u.deg, 19.825*u.deg,
     ...                                        4139*u.m)
     >>> subaru = Observer(location=location, name="Subaru", timezone="US/Hawaii")
-
     You can also create an observer without an
     `~astropy.coordinates.EarthLocation`:
-
     >>> from astroplan import Observer
     >>> import astropy.units as u
     >>> subaru = Observer(longitude=-155.4761*u.deg, latitude=19.825*u.deg,
     ...                   elevation=0*u.m, name="Subaru", timezone="US/Hawaii")
-
     """
     @u.quantity_input(elevation=u.m)
     def __init__(self, location=None, timezone='UTC', name=None, latitude=None,
@@ -117,37 +103,28 @@ class Observer(object):
         """
         Parameters
         ----------
-        name : str
-            A short name for the telescope, observatory or location.
-
         location : `~astropy.coordinates.EarthLocation`
             The location (latitude, longitude, elevation) of the observatory.
-
-        longitude : float, str, `~astropy.units.Quantity` (optional)
-            The longitude of the observing location. Should be valid input for
-            initializing a `~astropy.coordinates.Longitude` object.
-
-        latitude : float, str, `~astropy.units.Quantity` (optional)
-            The latitude of the observing location. Should be valid input for
-            initializing a `~astropy.coordinates.Latitude` object.
-
-        elevation : `~astropy.units.Quantity` (optional), default = 0 meters
-            The elevation of the observing location, with respect to sea
-            level. Defaults to sea level.
-
-        pressure : `~astropy.units.Quantity` (optional)
-            The ambient pressure. Defaults to zero (i.e. no atmosphere).
-
-        relative_humidity : float (optional)
-            The ambient relative humidity.
-
-        temperature : `~astropy.units.Quantity` (optional)
-            The ambient temperature.
-
         timezone : str or `datetime.tzinfo` (optional)
             The local timezone to assume. If a string, it will be passed
             through ``pytz.timezone()`` to produce the timezone object.
-
+        name : str
+            A short name for the telescope, observatory or location.
+        latitude : float, str, `~astropy.units.Quantity` (optional)
+            The latitude of the observing location. Should be valid input for
+            initializing a `~astropy.coordinates.Latitude` object.
+        longitude : float, str, `~astropy.units.Quantity` (optional)
+            The longitude of the observing location. Should be valid input for
+            initializing a `~astropy.coordinates.Longitude` object.
+        elevation : `~astropy.units.Quantity` (optional), default = 0 meters
+            The elevation of the observing location, with respect to sea
+            level. Defaults to sea level.
+        pressure : `~astropy.units.Quantity` (optional)
+            The ambient pressure. Defaults to zero (i.e. no atmosphere).
+        relative_humidity : float (optional)
+            The ambient relative humidity.
+        temperature : `~astropy.units.Quantity` (optional)
+            The ambient temperature.
         description : str (optional)
             A short description of the telescope, observatory or observing
             location.
@@ -188,10 +165,8 @@ class Observer(object):
     def __repr__(self):
         """
         String representation of the `~astroplan.Observer` object.
-
         Examples
         --------
-
         >>> from astroplan import Observer
         >>> keck = Observer.at_site("Keck", timezone="US/Hawaii")
         >>> print(keck)                                    # doctest: +FLOAT_CMP
@@ -211,8 +186,8 @@ class Observer(object):
                     formatted_loc = ["{} {}".format(i.value, i.unit)
                                      for i in value.to_geodetic()]
                     attributes_strings.append(
-                        "{} (lon, lat, el)=({})".format(name,
-                                                        ", ".join(formatted_loc)))
+                        "{} (lon, lat, el)=({})".format(
+                            name, ", ".join(formatted_loc)))
                 else:
                     if name != 'name':
                         value = repr(value)
@@ -225,26 +200,21 @@ class Observer(object):
     def at_site(cls, site_name, **kwargs):
         """
         Initialize an `~astroplan.observer.Observer` object with a site name.
-
         Extra keyword arguments are passed to the `~astroplan.Observer`
         constructor (see `~astroplan.Observer` for available keyword
         arguments).
-
         Parameters
         ----------
         site_name : str
             Observatory name, must be resolvable with
-            `~astroplan.get_site`.
-
+            `~astropy.coordinates.EarthLocation.get_site_names`.
         Returns
         -------
         `~astroplan.observer.Observer`
             Observer object.
-
         Examples
         --------
         Initialize an observer at Kitt Peak National Observatory:
-
         >>> from astroplan import Observer
         >>> import astropy.units as u
         >>> kpno_generic = Observer.at_site('kpno')
@@ -254,33 +224,27 @@ class Observer(object):
         if 'location' in kwargs:
             raise ValueError("Location kwarg should not be used if "
                              "initializing an Observer with Observer.at_site()")
-        return cls(location=get_site(site_name), name=name, **kwargs)
+        return cls(location=EarthLocation.of_site(site_name), name=name, **kwargs)
 
     def astropy_time_to_datetime(self, astropy_time):
         """
         Convert the `~astropy.time.Time` object ``astropy_time`` to a
         localized `~datetime.datetime` object.
-
         Timezones localized with `pytz`_.
-
         .. _pytz: https://pypi.python.org/pypi/pytz/
-
         Parameters
         ----------
         astropy_time : `~astropy.time.Time`
             Scalar or list-like.
-
         Returns
         -------
         `~datetime.datetime`
             Localized datetime, where the timezone of the datetime is
             set by the ``timezone`` keyword argument of the
             `~astroplan.Observer` constructor.
-
         Examples
         --------
         Convert an astropy time to a localized `~datetime.datetime`:
-
         >>> from astroplan import Observer
         >>> from astropy.time import Time
         >>> subaru = Observer.at_site("Subaru", timezone="US/Hawaii")
@@ -302,25 +266,20 @@ class Observer(object):
         """
         Convert the `~datetime.datetime` object ``date_time`` to a
         `~astropy.time.Time` object.
-
         Timezones localized with `pytz`_. If the ``date_time`` is naive, the
         implied timezone is the ``timezone`` structure of ``self``.
-
         Parameters
         ----------
         date_time : `~datetime.datetime` or list-like
-
         Returns
         -------
         `~astropy.time.Time`
             Astropy time object (no timezone information preserved).
-
         Examples
         --------
         Convert a localized `~datetime.datetime` to a `~astropy.time.Time`
         object. Non-localized datetimes are assumed to be UTC.
         <Time object: scale='utc' format='datetime' value=1999-12-31 06:00:00>
-
         >>> from astroplan import Observer
         >>> import datetime
         >>> import pytz
@@ -343,65 +302,62 @@ class Observer(object):
 
         return Time(date_time, location=self.location)
 
-    def _transform_target_list_to_altaz(self, times, targets):
+    def _is_broadcastable(self, shp1, shp2):
+        """Test if two shape tuples are broadcastable"""
+        if shp1 == shp2:
+            return True
+        for a, b in zip(shp1[::-1], shp2[::-1]):
+            if a == 1 or b == 1 or a == b:
+                pass
+            else:
+                return False
+        return True
+
+    def _preprocess_inputs(self, time, target=None, grid_times_targets=False):
         """
-        Workaround for transforming a list of coordinates ``targets`` to
-        altitudes and azimuths.
-
-        Parameters
-        ----------
-        times : `~astropy.time.Time` or list of `~astropy.time.Time` objects
-            Time of observation
-
-        targets : `~astropy.coordinates.SkyCoord` or list of `~astropy.coordinates.SkyCoord` objects
-            List of target coordinates
-
-        location : `~astropy.coordinates.EarthLocation`
-            Location of observer
-
-        Returns
-        -------
-        altitudes : list
-            List of altitudes for each target, at each time
+        Preprocess time and target inputs
+        This routine takes the inputs for time and target and attempts to
+        return a single `~astropy.time.Time` and `~astropy.coordinates.SkyCoord`
+        for each argument, which may be non-scalar if necessary.
+        time : `~astropy.time.Time` or other (see below)
+            The time(s) to use in the calculation. It can be anything that
+            `~astropy.time.Time` will accept (including a `~astropy.time.Time` object)
+        target : `~astroplan.FixedTarget`, `~astropy.coordinates.SkyCoord`, or list
+            The target(s) to use in the calculation.
+        grid_times_targets: bool
+            If True, the target object will have extra dimensions packed onto the end,
+            so that calculations with M targets and N times will return an (M, N)
+            shaped result. Otherwise, we rely on broadcasting the shapes together
+            using standard numpy rules. Useful for grid searches for rise/set times etc.
         """
-        if times.isscalar:
-            times = Time([times])
+        # make sure we have a non-scalar time
+        if not isinstance(time, Time):
+            time = Time(time)
 
-        if not isinstance(targets, list) and targets.isscalar:
-            targets = [targets]
+        if target is None:
+            return time, None
 
-        targets_is_unitsphericalrep = [x.data.__class__ is
-                                       UnitSphericalRepresentation for x in targets]
-        if all(targets_is_unitsphericalrep) or not any(targets_is_unitsphericalrep):
-            repeated_times = np.tile(times, len(targets))
-            ra_list = Longitude([x.icrs.ra for x in targets])
-            dec_list = Latitude([x.icrs.dec for x in targets])
-            repeated_ra = np.repeat(ra_list, len(times))
-            repeated_dec = np.repeat(dec_list, len(times))
-            inner_sc = SkyCoord(ra=repeated_ra, dec=repeated_dec)
-            target_SkyCoord = SkyCoord(inner_sc.data.represent_as(UnitSphericalRepresentation),
-                                       representation=UnitSphericalRepresentation)
-            transformed_coord = target_SkyCoord.transform_to(AltAz(location=self.location,
-                                                                   obstime=repeated_times))
-        else:
-            # TODO: This is super slow.
-            repeated_times = np.tile(times, len(targets))
-            repeated_targets = np.repeat(targets, len(times))
-            target_SkyCoord = SkyCoord(SkyCoord(repeated_targets).data.represent_as(
-                                       UnitSphericalRepresentation),
-                                       representation=UnitSphericalRepresentation)
+        # convert any kind of target argument to non-scalar SkyCoord
+        target = get_skycoord(target)
+        if grid_times_targets:
+            if target.isscalar:
+                # ensure we have a (1, 1) shape coord
+                target = SkyCoord(np.tile(target, 1))[:, np.newaxis]
+            else:
+                while target.ndim <= time.ndim:
+                    target = target[:, np.newaxis]
 
-            transformed_coord = target_SkyCoord.transform_to(AltAz(location=self.location,
-                                                                   obstime=repeated_times))
-        return transformed_coord
+        elif not self._is_broadcastable(target.shape, time.shape):
+            raise ValueError('Time and Target arguments cannot be broadcast '
+                             'against each other with shapes {} and {}'
+                             .format(time.shape, target.shape))
+        return time, target
 
-    def altaz(self, time, target=None, obswl=None):
+    def altaz(self, time, target=None, obswl=None, grid_times_targets=False):
         """
         Get an `~astropy.coordinates.AltAz` frame or coordinate.
-
         If ``target`` is None, generates an altitude/azimuth frame. Otherwise,
         calculates the transformation to that frame for the requested ``target``.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -410,26 +366,27 @@ class Observer(object):
             will be passed in as the first argument to the `~astropy.time.Time`
             initializer, so it can be anything that `~astropy.time.Time` will
             accept (including a `~astropy.time.Time` object)
-
-        target : `~astroplan.FixedTarget`, `~astropy.coordinates.SkyCoord`, or list; defaults to `None` (optional)
-            Celestial object(s) of interest. If ``target`` is `None`, return the
-            `~astropy.coordinates.AltAz` frame without coordinates.
-
+        target : `~astroplan.FixedTarget`, `~astropy.coordinates.SkyCoord`, or list (optional)
+            Celestial object(s) of interest. If ``target`` is `None`, returns
+            the `~astropy.coordinates.AltAz` frame without coordinates.
         obswl : `~astropy.units.Quantity` (optional)
             Wavelength of the observation used in the calculation.
-
+        grid_times_targets: bool (optional)
+            If True, the target object will have extra dimensions packed
+            onto the end, so that calculations with M targets and N times
+            will return an (M, N) shaped result. Otherwise, we rely on
+            broadcasting the shapes together using standard numpy
+            rules. Useful for grid searches for rise/set times etc.
         Returns
         -------
         `~astropy.coordinates.AltAz`
             If ``target`` is `None`, returns `~astropy.coordinates.AltAz` frame.
             If ``target`` is not `None`, returns the ``target`` transformed to
             the `~astropy.coordinates.AltAz` frame.
-
         Examples
         --------
         Create an instance of the `~astropy.coordinates.AltAz` frame for an
         observer at Apache Point Observatory at a particular time:
-
         >>> from astroplan import Observer
         >>> from astropy.time import Time
         >>> from astropy.coordinates import SkyCoord
@@ -437,18 +394,14 @@ class Observer(object):
         >>> time = Time('2001-02-03 04:05:06')
         >>> target = SkyCoord(0*u.deg, 0*u.deg)
         >>> altaz_frame = apo.altaz(time)
-
         Now transform the target's coordinates to the alt/az frame:
-
-        >>> target_altaz = target.transform_to(altaz_frame)
-
+        >>> target_altaz = target.transform_to(altaz_frame) # doctest: +SKIP
         Alternatively, construct an alt/az frame and transform the target to
         that frame all in one step:
-
-        >>> target_altaz = apo.altaz(time, target)
+        >>> target_altaz = apo.altaz(time, target) # doctest: +SKIP
         """
-        if not isinstance(time, Time):
-            time = Time(time)
+        if target is not None:
+            time, target = self._preprocess_inputs(time, target, grid_times_targets)
 
         altaz_frame = AltAz(location=self.location, obstime=time,
                             pressure=self.pressure, obswl=obswl,
@@ -458,68 +411,40 @@ class Observer(object):
             # Return just the frame
             return altaz_frame
         else:
-            # If target is a list of targets:
-            if _target_is_vector(target):
-                get_coord = lambda x: x.coord if hasattr(x, 'coord') else x
-                transformed_coords = self._transform_target_list_to_altaz(time,
-                                          list(map(get_coord, target)))
-                n_targets = len(target)
-                new_shape = (n_targets, int(len(transformed_coords)/n_targets))
+            return target.transform_to(altaz_frame)
 
-                for comp in transformed_coords.data.components:
-                    getattr(transformed_coords.data, comp).resize(new_shape)
-                return transformed_coords
-
-            # If single target is a FixedTarget or a SkyCoord:
-            if hasattr(target, 'coord'):
-                coordinate = target.coord
-            else:
-                coordinate = target
-            return coordinate.transform_to(altaz_frame)
-
-    def parallactic_angle(self, time, target):
-        '''
+    def parallactic_angle(self, time, target, grid_times_targets=False):
+        """
         Calculate the parallactic angle.
-
         Parameters
         ----------
         time : `~astropy.time.Time`
             Observation time.
-
         target : `~astroplan.FixedTarget` or `~astropy.coordinates.SkyCoord` or list
             Target celestial object(s).
-
+        grid_times_targets: bool
+            If True, the target object will have extra dimensions packed onto the end,
+            so that calculations with M targets and N times will return an (M, N)
+            shaped result. Otherwise, we rely on broadcasting the shapes together
+            using standard numpy rules.
         Returns
         -------
         `~astropy.coordinates.Angle`
             Parallactic angle.
-
         Notes
         -----
         The parallactic angle is the angle between the great circle that
         intersects a celestial object and the zenith, and the object's hour
         circle [1]_.
-
         .. [1] https://en.wikipedia.org/wiki/Parallactic_angle
-
-        '''
-        if not isinstance(time, Time):
-            time = Time(time)
-
-        if _target_is_vector(target):
-            get_coord = lambda x: x.coord if hasattr(x, 'coord') else x
-            coordinate = SkyCoord(list(map(get_coord, target)))
-        else:
-            if hasattr(target, 'coord'):
-                coordinate = target.coord
-            else:
-                coordinate = target
+        """
+        time, coordinate = self._preprocess_inputs(time, target, grid_times_targets)
 
         # Eqn (14.1) of Meeus' Astronomical Algorithms
-        LST = time.sidereal_time('mean', longitude=self.location.longitude)
+        LST = time.sidereal_time('mean', longitude=self.location.lon)
         H = (LST - coordinate.ra).radian
         q = np.arctan(np.sin(H) /
-                      (np.tan(self.location.latitude.radian)*
+                      (np.tan(self.location.lat.radian) *
                        np.cos(coordinate.dec.radian) -
                        np.sin(coordinate.dec.radian)*np.cos(H)))*u.rad
 
@@ -531,141 +456,166 @@ class Observer(object):
         """
         Find time ``t`` when values in array ``a`` go from
         negative to positive or positive to negative (exclude endpoints)
-
         ``return_limits`` will return nearest times to zero-crossing.
-
         Parameters
         ----------
         t : `~astropy.time.Time`
-            Grid of times
+            Grid of N times, any shape. Search grid along first axis, e.g (N, ...)
         alt : `~astropy.units.Quantity`
             Grid of altitudes
+            Depending on broadcasting we either have ndim >=3 and
+            M targets along first axis, e.g (M, N, ...), or
+            ndim = 2 and targets/times in last axis
         rise_set : {"rising",  "setting"}
             Calculate either rising or setting across the horizon
         horizon : float
             Number of degrees above/below actual horizon to use
             for calculating rise/set times (i.e.,
             -6 deg horizon = civil twilight, etc.)
-
         Returns
         -------
         Returns the lower and upper limits on the time and altitudes
-        of the horizon crossing.
+        of the horizon crossing. The altitude limits have shape (M, ...) and the
+        time limits have shape (...). These arrays aresuitable for interpolation
+        to find the horizon crossing time.
         """
-        alt = np.atleast_2d(Latitude(alt))
-        n_targets = alt.shape[0]
+        # handle different cases by enforcing standard shapes on
+        # the altitude grid
+        finesse_time_indexes = False
+        if alt.ndim == 1:
+            raise ValueError('Must supply more at least a 2D grid of altitudes')
+        elif alt.ndim == 2:
+            # TODO: this test for ndim=2 doesn't work. if times is e.g (2,5)
+            # then alt will have ndim=3, but shape (100, 2, 5) so grid
+            # is in first index...
+            ntargets = alt.shape[1]
+            ngrid = alt.shape[0]
+            unit = alt.unit
+            alt = np.broadcast_to(alt, (ntargets, ngrid, ntargets)).T
+            alt = alt*unit
+            extra_dimension_added = True
+            if t.shape[1] == 1:
+                finesse_time_indexes = True
+        else:
+            extra_dimension_added = False
+        output_shape = (alt.shape[0],) + alt.shape[2:]
 
         if rise_set == 'rising':
             # Find index where altitude goes from below to above horizon
-            condition = (alt[:, :-1] < horizon) * (alt[:, 1:] > horizon)
+            condition = (alt[:, :-1, ...] < horizon) * (alt[:, 1:, ...] > horizon)
         elif rise_set == 'setting':
             # Find index where altitude goes from above to below horizon
-            condition = (alt[:, :-1] > horizon) * (alt[:, 1:] < horizon)
+            condition = (alt[:, :-1, ...] > horizon) * (alt[:, 1:, ...] < horizon)
 
-        target_inds, time_inds = np.nonzero(condition)
+        noncrossing_indices = np.sum(condition, axis=1, dtype=np.intp) < 1
+        alt_lims1 = u.Quantity(np.zeros(output_shape), unit=u.deg)
+        alt_lims2 = u.Quantity(np.zeros(output_shape), unit=u.deg)
+        jd_lims1 = np.zeros(output_shape)
+        jd_lims2 = np.zeros(output_shape)
+        if np.any(noncrossing_indices):
+            for target_index in set(np.where(noncrossing_indices)[0]):
+                warnmsg = ('Target with index {} does not cross horizon={} within '
+                           '24 hours'.format(target_index, horizon))
+                if (alt[target_index, ...] > horizon).all():
+                    warnings.warn(warnmsg, TargetAlwaysUpWarning)
+                else:
+                    warnings.warn(warnmsg, TargetNeverUpWarning)
 
-        if np.count_nonzero(condition) < n_targets:
-            target_inds, _ = np.nonzero(condition)
-            noncrossing_target_ind = np.setdiff1d(np.arange(n_targets),
-                                                  target_inds,
-                                                  assume_unique=True)#[0]
+            alt_lims1[np.nonzero(noncrossing_indices)] = np.nan
+            alt_lims2[np.nonzero(noncrossing_indices)] = np.nan
+            jd_lims1[np.nonzero(noncrossing_indices)] = np.nan
+            jd_lims2[np.nonzero(noncrossing_indices)] = np.nan
 
-            warnmsg = ('Target(s) index {} does not cross horizon={} within '
-                       '24 hours'.format(noncrossing_target_ind, horizon))
+        before_indices = np.array(np.nonzero(condition))
+        # we want to add an vector like (0, 1, ...) to get after indices
+        after_indices = before_indices.copy()
+        after_indices[1, :] += 1
 
-            if (alt[noncrossing_target_ind, :] > horizon).all():
-                warnings.warn(warnmsg, TargetAlwaysUpWarning)
-            else:
-                warnings.warn(warnmsg, TargetNeverUpWarning)
+        al1 = alt[tuple(before_indices)]
+        al2 = alt[tuple(after_indices)]
+        # slice the time in the same way, but delete the object index
+        before_time_index_tuple = np.delete(before_indices, 0, 0)
+        after_time_index_tuple = np.delete(after_indices, 0, 0)
+        if finesse_time_indexes:
+            before_time_index_tuple[1:] = 0
+            after_time_index_tuple[1:] = 0
+        tl1 = t[tuple(before_time_index_tuple)]
+        tl2 = t[tuple(after_time_index_tuple)]
 
-            # Fill in missing time with MAGIC_TIME
-            target_inds = np.insert(target_inds, noncrossing_target_ind,
-                                    noncrossing_target_ind)
-            time_inds = np.insert(time_inds.astype(float),
-                                  noncrossing_target_ind,
-                                  np.nan)
-        elif np.count_nonzero(condition) > n_targets:
-            old_target_inds = np.copy(target_inds)
-            old_time_inds = np.copy(time_inds)
+        alt_lims1[tuple(np.delete(before_indices, 1, 0))] = al1
+        alt_lims2[tuple(np.delete(before_indices, 1, 0))] = al2
+        jd_lims1[tuple(np.delete(before_indices, 1, 0))] = tl1.utc.jd
+        jd_lims2[tuple(np.delete(before_indices, 1, 0))] = tl2.utc.jd
 
-            time_inds = []
-            target_inds = []
-            for tgt, tm in zip(old_target_inds, old_time_inds):
-                if tgt not in target_inds:
-                    time_inds.append(tm)
-                    target_inds.append(tgt)
-            target_inds = np.array(target_inds)
-            time_inds = np.array(time_inds)
-
-        times = [t[i:i+2] if not np.isnan(i) else np.nan for i in time_inds]
-        altitudes = [alt[i, j:j+2] if not np.isnan(j) else np.nan
-                     for i, j in zip(target_inds, time_inds)]
-
-        return times, altitudes
+        if extra_dimension_added:
+            return (alt_lims1.diagonal(), alt_lims2.diagonal(),
+                    jd_lims1.diagonal(), jd_lims2.diagonal())
+        else:
+            return alt_lims1, alt_lims2, jd_lims1, jd_lims2
 
     @u.quantity_input(horizon=u.deg)
-    def _two_point_interp(self, times, altitudes, horizon=0*u.deg):
+    def _two_point_interp(self, jd_before, jd_after,
+                          alt_before, alt_after, horizon=0*u.deg):
         """
         Do linear interpolation between two ``altitudes`` at
         two ``times`` to determine the time where the altitude
         goes through zero.
-
         Parameters
         ----------
-        times : `~astropy.time.Time`
-            Two times for linear interpolation between
-
-        altitudes : array of `~astropy.units.Quantity`
-            Two altitudes for linear interpolation between
-
+        jd_before : `float`
+            JD(UTC) before crossing event
+        jd_after : `float`
+            JD(UTC) after crossing event
+        alt_before : `~astropy.units.Quantity`
+            altitude before crossing event
+        alt_after : `~astropy.units.Quantity`
+            altitude after crossing event
         horizon : `~astropy.units.Quantity`
             Solve for the time when the altitude is equal to
             reference_alt.
-
         Returns
         -------
         t : `~astropy.time.Time`
             Time when target crosses the horizon
-
         """
-        if not isinstance(times, Time):
-            return MAGIC_TIME
-        else:
-            slope = (altitudes[1] - altitudes[0])/(times[1].jd - times[0].jd)
-            return Time(times[1].jd - ((altitudes[1] - horizon)/slope).value,
-                        format='jd')
+        slope = (alt_after-alt_before)/((jd_after - jd_before)*u.d)
+        crossing_jd = (jd_after*u.d - ((alt_after - horizon)/slope))
+        crossing_jd[np.isnan(crossing_jd)] = u.d*MAGIC_TIME.jd
+        return np.squeeze(Time(crossing_jd, format='jd'))
 
-    def _altitude_trig(self, LST, target):
+    def _altitude_trig(self, LST, target, grid_times_targets=False):
         """
         Calculate the altitude of ``target`` at local sidereal times ``LST``.
-
         This method provides a factor of ~3 speed up over calling `altaz`, and
         inherently does *not* take the atmosphere into account.
-
         Parameters
         ----------
         LST : `~astropy.time.Time`
             Local sidereal times (array)
-
         target : {`~astropy.coordinates.SkyCoord`, `FixedTarget`} or similar
             Target celestial object's coordinates.
-
+        grid_times_targets: bool
+            If True, the target object will have extra dimensions packed onto the end,
+            so that calculations with M targets and N times will return an (M, N)
+            shaped result. Otherwise, we rely on broadcasting the shapes together
+            using standard numpy rules. Useful for grid searches for rise/set times etc.
         Returns
         -------
         alt : `~astropy.unit.Quantity`
             Array of altitudes
         """
-        alt = np.arcsin(np.sin(self.location.latitude.radian) *
+        LST, target = self._preprocess_inputs(LST, target, grid_times_targets)
+        alt = np.arcsin(np.sin(self.location.lat.radian) *
                         np.sin(target.dec) +
-                        np.cos(self.location.latitude.radian) *
+                        np.cos(self.location.lat.radian) *
                         np.cos(target.dec) *
                         np.cos(LST.radian - target.ra.radian))
         return alt
 
-    def _calc_riseset(self, time, target, prev_next, rise_set, horizon, N=150):
+    def _calc_riseset(self, time, target, prev_next, rise_set, horizon,
+                      N=150, grid_times_targets=False):
         """
         Time at next rise/set of ``target``.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -673,66 +623,65 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object)
-
         target : `~astropy.coordinates.SkyCoord`
             Position of target or multiple positions of that target
             at multiple times (if target moves, like the Sun)
-
         prev_next : str - either 'previous' or 'next'
             Test next rise/set or previous rise/set
-
         rise_set : str - either 'rising' or 'setting'
             Compute prev/next rise or prev/next set
-
-        location : `~astropy.coordinates.EarthLocation`
-            Location of observer
-
         horizon : `~astropy.units.Quantity`
             Degrees above/below actual horizon to use
             for calculating rise/set times (i.e.,
             -6 deg horizon = civil twilight, etc.)
-
         N : int
             Number of altitudes to compute when searching for
             rise or set.
-
+        grid_times_targets: bool
+            If True, the target object will have extra dimensions packed onto the end,
+            so that calculations with M targets and N times will return an (M, N)
+            shaped result. Otherwise, we rely on broadcasting the shapes together
+            using standard numpy rules.
         Returns
         -------
         ret1 : `~astropy.time.Time`
             Time of rise/set
         """
-
         if not isinstance(time, Time):
             time = Time(time)
 
-        target_is_vector = _target_is_vector(target)
-
         if prev_next == 'next':
-            times = _generate_24hr_grid(time, 0, 1, N)
+            start = 0
+            end = (1 + (target.approx_sidereal_drift.to(u.day).value
+                        if hasattr(target, 'approx_sidereal_drift') else 0))
         else:
-            times = _generate_24hr_grid(time, -1, 0, N)
+            start = (-1 - (target.approx_sidereal_drift.to(u.day).value
+                           if hasattr(target, 'approx_sidereal_drift') else 0))
+            end = 0
 
-        altaz = self.altaz(times, target)
-        if target_is_vector:
-            altitudes = [aa.alt for aa in altaz]
+        times = _generate_24hr_grid(time, start, end, N)
+
+        if target is MoonFlag:
+            altaz = self.altaz(times, get_moon(times, location=self.location),
+                               grid_times_targets=grid_times_targets)
+        elif target is SunFlag:
+            altaz = self.altaz(times, get_sun(times),
+                               grid_times_targets=grid_times_targets)
         else:
-            altitudes = altaz.alt
+            altaz = self.altaz(times, target,
+                               grid_times_targets=grid_times_targets)
 
-        time_limits, altitude_limits = self._horiz_cross(times, altitudes, rise_set,
-                                                    horizon)
-        if not target_is_vector:
-            return self._two_point_interp(time_limits[0], altitude_limits[0],
-                                          horizon=horizon)
-        else:
-            return Time([self._two_point_interp(time_limit, altitude_limit,
-                                                horizon=horizon)
-                         for time_limit, altitude_limit in
-                         zip(time_limits, altitude_limits)])
+        altitudes = altaz.alt
 
-    def _calc_transit(self, time, target, prev_next, antitransit=False, N=150):
+        al1, al2, jd1, jd2 = self._horiz_cross(times, altitudes, rise_set,
+                                               horizon)
+        return self._two_point_interp(jd1, jd2, al1, al2,
+                                      horizon=horizon)
+
+    def _calc_transit(self, time, target, prev_next, antitransit=False,
+                      N=150, grid_times_targets=False):
         """
         Time at next transit of the meridian of `target`.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -740,34 +689,30 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object)
-
         target : `~astropy.coordinates.SkyCoord`
             Position of target or multiple positions of that target
             at multiple times (if target moves, like the Sun)
-
         prev_next : str - either 'previous' or 'next'
             Test next rise/set or previous rise/set
-
         antitransit : bool
             Toggle compute antitransit (below horizon, equivalent to midnight
             for the Sun)
-
-        location : `~astropy.coordinates.EarthLocation`
-            Location of observer
-
         N : int
             Number of altitudes to compute when searching for
             rise or set.
-
+        grid_times_targets: bool
+            If True, the target object will have extra dimensions packed onto the end,
+            so that calculations with M targets and N times will return an (M, N)
+            shaped result. Otherwise, we rely on broadcasting the shapes together
+            using standard numpy rules.
         Returns
         -------
         ret1 : `~astropy.time.Time`
             Time of transit/antitransit
         """
+        # TODO FIX BROADCASTING HERE
         if not isinstance(time, Time):
             time = Time(time)
-
-        target_is_vector = _target_is_vector(target)
 
         if prev_next == 'next':
             times = _generate_24hr_grid(time, 0, 1, N, for_deriv=True)
@@ -781,26 +726,22 @@ class Observer(object):
         else:
             rise_set = 'setting'
 
-        altaz = self.altaz(times, target)
-        if target_is_vector:
-            d_altitudes = [each_alt.diff() for each_alt in altaz.alt]
+        altaz = self.altaz(times, target, grid_times_targets=grid_times_targets)
+        altitudes = altaz.alt
+        if altitudes.ndim > 2:
+            # shape is (M, N, ...) where M is targets and N is grid
+            d_altitudes = altitudes.diff(axis=1)
         else:
-            altitudes = altaz.alt
-            d_altitudes = altitudes.diff()
+            # shape is (N, M) where M is targets and N is grid
+            d_altitudes = altitudes.diff(axis=0)
 
         dt = Time((times.jd[1:] + times.jd[:-1])/2, format='jd')
 
-        horizon = 0*u.degree # Find when derivative passes through zero
-        time_limits, altitude_limits = self._horiz_cross(dt, d_altitudes,
-                                                         rise_set, horizon)
-        if not target_is_vector:
-            return self._two_point_interp(time_limits[0], altitude_limits[0],
-                                          horizon=horizon)
-        else:
-            return Time([self._two_point_interp(time_limit, altitude_limit,
-                                                horizon=horizon)
-                         for time_limit, altitude_limit in
-                         zip(time_limits, altitude_limits)])
+        horizon = 0*u.degree  # Find when derivative passes through zero
+        al1, al2, jd1, jd2 = self._horiz_cross(dt, d_altitudes,
+                                               rise_set, horizon)
+        return self._two_point_interp(jd1, jd2, al1, al2,
+                                      horizon=horizon)
 
     def _determine_which_event(self, function, args_dict):
         """
@@ -814,12 +755,17 @@ class Observer(object):
         horizon = args_dict.pop('horizon', None)
         rise_set = args_dict.pop('rise_set', None)
         antitransit = args_dict.pop('antitransit', None)
+        grid_times_targets = args_dict.pop('grid_times_targets', False)
 
         # Assemble arguments for function, depending on the function.
         if function == self._calc_riseset:
-            args = lambda w: (time, target, w, rise_set, horizon)
+            def event_function(w):
+                return function(time, target, w, rise_set, horizon,
+                                grid_times_targets=grid_times_targets)
         elif function == self._calc_transit:
-            args = lambda w: (time, target, w, antitransit)
+            def event_function(w):
+                return function(time, target, w, antitransit=antitransit,
+                                grid_times_targets=grid_times_targets)
         else:
             raise ValueError('Function {} not supported in '
                              '_determine_which_event.'.format(function))
@@ -828,43 +774,32 @@ class Observer(object):
             time = Time(time)
 
         if which == 'next' or which == 'nearest':
-            next_event = function(*args('next'))
+            next_event = event_function('next')
             if which == 'next':
                 return next_event
 
         if which == 'previous' or which == 'nearest':
-            previous_event = function(*args('previous'))
+            previous_event = event_function('previous')
             if which == 'previous':
                 return previous_event
 
         if which == 'nearest':
-            if _target_is_vector(target):
-                return_times = []
-                for next_e, prev_e in zip(next_event, previous_event):
-                    if abs(time - prev_e) < abs(time - next_e):
-                        return_times.append(prev_e)
-                    else:
-                        return_times.append(next_e)
-                return Time(return_times)
-            else:
-                if abs(time - previous_event) < abs(time - next_event):
-                    return previous_event
-                else:
-                    return next_event
+            mask = abs(time - previous_event) < abs(time - next_event)
+            return Time(np.where(mask, previous_event.utc.jd,
+                                 next_event.utc.jd), format='jd')
 
         raise ValueError('"which" kwarg must be "next", "previous" or '
                          '"nearest".')
 
     @u.quantity_input(horizon=u.deg)
-    def target_rise_time(self, time, target, which='nearest', horizon=0*u.degree):
+    def target_rise_time(self, time, target, which='nearest', horizon=0*u.degree,
+                         grid_times_targets=False):
         """
         Calculate rise time.
-
         Compute time of the next/previous/nearest rise of the ``target``
         object, where "rise" is defined as the time when the ``target``
         transitions from altitudes below the ``horizon`` to above the
         ``horizon``.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -872,51 +807,50 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object)
-
-        target : coordinate object (i.e. `~astropy.coordinates.SkyCoord`, `~astroplan.FixedTarget`) or list
+        target : `~astropy.coordinates.SkyCoord`, `~astroplan.FixedTarget`, or list
             Target celestial object(s)
-
         which : {'next', 'previous', 'nearest'}
             Choose which sunrise relative to the present ``time`` would you
             like to calculate
-
         horizon : `~astropy.units.Quantity` (optional), default = zero degrees
             Degrees above/below actual horizon to use
             for calculating rise/set times (i.e.,
             -6 deg horizon = civil twilight, etc.)
-
+        grid_times_targets: bool
+            If True, the target object will have extra dimensions packed
+            onto the end, so that calculations with M targets and N times
+            will return an (M, N) shaped result. Otherwise, we rely on
+            broadcasting the shapes together using standard numpy rules.
         Returns
         -------
         `~astropy.time.Time`
             Rise time of target
-
         Examples
         --------
         Calculate the rise time of Rigel at Keck Observatory:
-
         >>> from astroplan import Observer, FixedTarget
         >>> from astropy.time import Time
         >>> time = Time("2001-02-03 04:05:06")
         >>> target = FixedTarget.from_name("Rigel")
         >>> keck = Observer.at_site("Keck")
-        >>> rigel_rise_time = keck.target_rise_time(time, target, which="next")
-        >>> print("ISO: {0.iso}, JD: {0.jd}".format(rigel_rise_time)) # doctest: +FLOAT_CMP
+        >>> rigel_rise_time = keck.target_rise_time(time, target, which="next") # doctest: +SKIP
+        >>> print("ISO: {0.iso}, JD: {0.jd}".format(rigel_rise_time)) # doctest: +SKIP
         ISO: 2001-02-04 00:51:23.330, JD: 2451944.53569
         """
         return self._determine_which_event(self._calc_riseset,
                                            dict(time=time, target=target,
                                                 which=which, rise_set='rising',
-                                                horizon=horizon))
+                                                horizon=horizon,
+                                                grid_times_targets=grid_times_targets))
 
     @u.quantity_input(horizon=u.deg)
-    def target_set_time(self, time, target, which='nearest', horizon=0*u.degree):
+    def target_set_time(self, time, target, which='nearest', horizon=0*u.degree,
+                        grid_times_targets=False):
         """
         Calculate set time.
-
         Compute time of the next/previous/nearest set of ``target``, where
         "set" is defined as when the ``target`` transitions from altitudes
         above ``horizon`` to below ``horizon``.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -924,49 +858,47 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object)
-
-        target : coordinate object (i.e. `~astropy.coordinates.SkyCoord`, `~astroplan.FixedTarget`) or list
+        target : `~astropy.coordinates.SkyCoord`, `~astroplan.FixedTarget`, or list
             Target celestial object(s)
-
         which : {'next', 'previous', 'nearest'}
             Choose which sunset relative to the present ``time`` would you
             like to calculate
-
         horizon : `~astropy.units.Quantity` (optional), default = zero degrees
             Degrees above/below actual horizon to use
             for calculating rise/set times (i.e.,
             -6 deg horizon = civil twilight, etc.)
-
+        grid_times_targets: bool
+            If True, the target object will have extra dimensions packed
+            onto the end, so that calculations with M targets and N times
+            will return an (M, N) shaped result. Otherwise, we rely on
+            broadcasting the shapes together using standard numpy rules.
         Returns
         -------
         `~astropy.time.Time`
             Set time of target.
-
         Examples
         --------
         Calculate the set time of Rigel at Keck Observatory:
-
         >>> from astroplan import Observer, FixedTarget
         >>> from astropy.time import Time
         >>> time = Time("2001-02-03 04:05:06")
         >>> target = FixedTarget.from_name("Rigel")
         >>> keck = Observer.at_site("Keck")
-        >>> rigel_set_time = keck.target_set_time(time, target, which="next")
-        >>> print("ISO: {0.iso}, JD: {0.jd}".format(rigel_set_time)) # doctest: +FLOAT_CMP
+        >>> rigel_set_time = keck.target_set_time(time, target, which="next") # doctest: +SKIP
+        >>> print("ISO: {0.iso}, JD: {0.jd}".format(rigel_set_time)) # doctest: +SKIP
         ISO: 2001-02-03 12:29:34.768, JD: 2451944.02054
         """
         return self._determine_which_event(self._calc_riseset,
                                            dict(time=time, target=target,
                                                 which=which, rise_set='setting',
-                                                horizon=horizon))
+                                                horizon=horizon,
+                                                grid_times_targets=grid_times_targets))
 
-    def target_meridian_transit_time(self, time, target, which='nearest'):
+    def target_meridian_transit_time(self, time, target, which='nearest', grid_times_targets=False):
         """
         Calculate time at the transit of the meridian.
-
         Compute time of the next/previous/nearest transit of the ``target``
         object.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -974,45 +906,45 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object)
-
-        target : coordinate object (i.e. `~astropy.coordinates.SkyCoord`, `~astroplan.FixedTarget`) or list
+        target : `~astropy.coordinates.SkyCoord`, `~astroplan.FixedTarget`, or list
             Target celestial object(s)
-
         which : {'next', 'previous', 'nearest'}
             Choose which sunrise relative to the present ``time`` would you
             like to calculate
-
+        grid_times_targets: bool
+            If True, the target object will have extra dimensions packed
+            onto the end, so that calculations with M targets and N times
+            will return an (M, N) shaped result. Otherwise, we rely on
+            broadcasting the shapes together using standard numpy rules.
         Returns
         -------
         `~astropy.time.Time`
             Transit time of target
-
         Examples
         --------
         Calculate the meridian transit time of Rigel at Keck Observatory:
-
         >>> from astroplan import Observer, FixedTarget
         >>> from astropy.time import Time
         >>> time = Time("2001-02-03 04:05:06")
         >>> target = FixedTarget.from_name("Rigel")
         >>> keck = Observer.at_site("Keck")
         >>> rigel_transit_time = keck.target_meridian_transit_time(time, target,
-        ...                                                        which="next")
-        >>> print("ISO: {0.iso}, JD: {0.jd}".format(rigel_transit_time)) # doctest: +FLOAT_CMP
+        ...                                                        which="next") # doctest: +SKIP
+        >>> print("ISO: {0.iso}, JD: {0.jd}".format(rigel_transit_time)) # doctest: +SKIP
         ISO: 2001-02-03 06:42:26.863, JD: 2451943.77948
         """
         return self._determine_which_event(self._calc_transit,
                                            dict(time=time, target=target,
                                                 which=which,
-                                                rise_set='setting'))
+                                                rise_set='setting',
+                                                grid_times_targets=grid_times_targets))
 
-    def target_meridian_antitransit_time(self, time, target, which='nearest'):
+    def target_meridian_antitransit_time(self, time, target, which='nearest',
+                                         grid_times_targets=False):
         """
         Calculate time at the antitransit of the meridian.
-
         Compute time of the next/previous/nearest antitransit of the ``target``
         object.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1020,48 +952,46 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
-        target : coordinate object (i.e. `~astropy.coordinates.SkyCoord`, `~astroplan.FixedTarget`) or list
+        target : `~astropy.coordinates.SkyCoord`, `~astroplan.FixedTarget`, or list
             Target celestial object(s)
-
         which : {'next', 'previous', 'nearest'}
             Choose which sunrise relative to the present ``time`` would you
             like to calculate
-
+        grid_times_targets : bool
+            If True, the target object will have extra dimensions packed onto the end,
+            so that calculations with M targets and N times will return an (M, N)
+            shaped result. Otherwise, we rely on broadcasting the shapes together
+            using standard numpy rules.
         Returns
         -------
         `~astropy.time.Time`
             Antitransit time of target
-
         Examples
         --------
         Calculate the meridian anti-transit time of Rigel at Keck Observatory:
-
         >>> from astroplan import Observer, FixedTarget
         >>> from astropy.time import Time
         >>> time = Time("2001-02-03 04:05:06")
         >>> target = FixedTarget.from_name("Rigel")
         >>> keck = Observer.at_site("Keck")
-        >>> rigel_antitransit_time = keck.target_meridian_antitransit_time(time, target,
-        ...                                                                which="next")
-        >>> print("ISO: {0.iso}, JD: {0.jd}".format(rigel_antitransit_time)) # doctest: +FLOAT_CMP
+        >>> rigel_antitransit_time = keck.target_meridian_antitransit_time(
+        ...     time, target, which="next") # doctest: +SKIP
+        >>> print("ISO: {0.iso}, JD: {0.jd}".format(rigel_antitransit_time)) # doctest: +SKIP
         ISO: 2001-02-03 18:40:29.761, JD: 2451944.27812
-
         """
         return self._determine_which_event(self._calc_transit,
                                            dict(time=time, target=target,
                                                 which=which, antitransit=True,
-                                                rise_set='setting'))
+                                                rise_set='setting',
+                                                grid_times_targets=grid_times_targets))
 
     @u.quantity_input(horizon=u.deg)
     def sun_rise_time(self, time, which='nearest', horizon=0*u.degree):
         """
         Time of sunrise.
-
         Compute time of the next/previous/nearest sunrise, where
         sunrise is defined as when the Sun transitions from altitudes
         below ``horizon`` to above ``horizon``.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1069,30 +999,25 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
         which : {'next', 'previous', 'nearest'}
             Choose which sunrise relative to the present ``time`` would you
             like to calculate.
-
         horizon : `~astropy.units.Quantity` (optional), default = zero degrees
             Degrees above/below actual horizon to use
             for calculating rise/set times (i.e.,
             -6 deg horizon = civil twilight, etc.)
-
         Returns
         -------
         `~astropy.time.Time`
             Time of sunrise
-
         Examples
         --------
         Calculate the time of the previous sunrise at Apache Point Observatory:
-
         >>> from astroplan import Observer
         >>> from astropy.time import Time
         >>> apo = Observer.at_site("APO")
         >>> time = Time('2001-02-03 04:05:06')
-        >>> sun_rise = apo.sun_rise_time(time, which="previous")
+        >>> sun_rise = apo.sun_rise_time(time, which="previous") # doctest: +SKIP
         >>> print("ISO: {0.iso}, JD: {0.jd}".format(sun_rise)) # doctest: +SKIP
         ISO: 2001-02-02 14:02:50.554, JD: 2451943.08531
         """
@@ -1102,11 +1027,9 @@ class Observer(object):
     def sun_set_time(self, time, which='nearest', horizon=0*u.degree):
         """
         Time of sunset.
-
         Compute time of the next/previous/nearest sunset, where
         sunset is defined as when the Sun transitions from altitudes
         below ``horizon`` to above ``horizon``.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1114,30 +1037,25 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
         which : {'next', 'previous', 'nearest'}
             Choose which sunset relative to the present ``time`` would you
             like to calculate
-
         horizon : `~astropy.units.Quantity` (optional), default = zero degrees
             Degrees above/below actual horizon to use
             for calculating rise/set times (i.e.,
             -6 deg horizon = civil twilight, etc.)
-
         Returns
         -------
         `~astropy.time.Time`
             Time of sunset
-
         Examples
         --------
         Calculate the time of the next sunset at Apache Point Observatory:
-
         >>> from astroplan import Observer
         >>> from astropy.time import Time
         >>> apo = Observer.at_site("APO")
         >>> time = Time('2001-02-03 04:05:06')
-        >>> sun_set = apo.sun_set_time(time, which="next")
+        >>> sun_set = apo.sun_set_time(time, which="next") # doctest: +SKIP
         >>> print("ISO: {0.iso}, JD: {0.jd}".format(sun_set)) # doctest: +SKIP
         ISO: 2001-02-04 00:35:42.102, JD: 2451944.52479
         """
@@ -1146,7 +1064,6 @@ class Observer(object):
     def noon(self, time, which='nearest'):
         """
         Time at solar noon.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1154,11 +1071,9 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
         which : {'next', 'previous', 'nearest'}
             Choose which noon relative to the present ``time`` would you
             like to calculate
-
         Returns
         -------
         `~astropy.time.Time`
@@ -1169,7 +1084,6 @@ class Observer(object):
     def midnight(self, time, which='nearest'):
         """
         Time at solar midnight.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1177,11 +1091,9 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
         which : {'next', 'previous', 'nearest'}
             Choose which noon relative to the present ``time`` would you
             like to calculate
-
         Returns
         -------
         `~astropy.time.Time`
@@ -1194,7 +1106,6 @@ class Observer(object):
     def twilight_evening_astronomical(self, time, which='nearest'):
         """
         Time at evening astronomical (-18 degree) twilight.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1202,11 +1113,9 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
         which : {'next', 'previous', 'nearest'}
             Choose which twilight relative to the present ``time`` would you
             like to calculate. Default is nearest.
-
         Returns
         -------
         `~astropy.time.Time`
@@ -1215,10 +1124,8 @@ class Observer(object):
         return self.sun_set_time(time, which, horizon=-18*u.degree)
 
     def twilight_evening_nautical(self, time, which='nearest'):
-
         """
         Time at evening nautical (-12 degree) twilight.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1226,11 +1133,9 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
         which : {'next', 'previous', 'nearest'}
             Choose which twilight relative to the present ``time`` would you
             like to calculate. Default is nearest.
-
         Returns
         -------
         `~astropy.time.Time`
@@ -1241,7 +1146,6 @@ class Observer(object):
     def twilight_evening_civil(self, time, which='nearest'):
         """
         Time at evening civil (-6 degree) twilight.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1249,11 +1153,9 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
         which : {'next', 'previous', 'nearest'}
             Choose which twilight relative to the present ``time`` would you
             like to calculate. Default is nearest.
-
         Returns
         -------
         `~astropy.time.Time`
@@ -1264,7 +1166,6 @@ class Observer(object):
     def twilight_morning_astronomical(self, time, which='nearest'):
         """
         Time at morning astronomical (-18 degree) twilight.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1272,11 +1173,9 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
         which : {'next', 'previous', 'nearest'}
             Choose which twilight relative to the present ``time`` would you
             like to calculate
-
         Returns
         -------
         `~astropy.time.Time`
@@ -1287,7 +1186,6 @@ class Observer(object):
     def twilight_morning_nautical(self, time, which='nearest'):
         """
         Time at morning nautical (-12 degree) twilight.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1295,11 +1193,9 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
         which : {'next', 'previous', 'nearest'}
             Choose which twilight relative to the present ``time`` would you
             like to calculate. Default is nearest.
-
         Returns
         -------
         `~astropy.time.Time`
@@ -1310,7 +1206,6 @@ class Observer(object):
     def twilight_morning_civil(self, time, which='nearest'):
         """
         Time at morning civil (-6 degree) twilight.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1318,11 +1213,9 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
         which : {'next', 'previous', 'nearest'}
             Choose which twilight relative to the present ``time`` would you
             like to calculate. Default is nearest.
-
         Returns
         -------
         `~astropy.time.Time`
@@ -1332,46 +1225,55 @@ class Observer(object):
 
     # Moon-related methods.
 
-    def moon_rise_time(self, time, **kwargs):
+    def moon_rise_time(self, time, which='nearest', horizon=0*u.deg):
         """
-        Returns the local moonrise time.
-
-        The default moonrise returned is the next one to occur.
-
+        Returns the local moon rise time.
+        Compute time of the next/previous/nearest moon rise, where
+        moon rise is defined as the time when the moon transitions from
+        altitudes below ``horizon`` to above ``horizon``.
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
-
-        Keywords: str, optional
-            previous
-            next
-        """
-        raise NotImplementedError()
-
-    def moon_set_time(self, time, **kwargs):
-        """
-        Returns the local moonset time.
-
-        The default moonset returned is the next one to occur.
-
-        Parameters
-        ----------
-        time : `~astropy.time.Time` or other (see below)
-            This will be passed in as the first argument to
+            Time of observation. This will be passed in as the first argument to
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
-        Keywords: str, optional
-            previous
-            next
+        which : {'next', 'previous', 'nearest'}
+            Choose which moon rise relative to the present ``time`` would you
+            like to calculate.
+        horizon : `~astropy.units.Quantity` (optional), default = zero degrees
+            Degrees above/below actual horizon to use
+            for calculating rise/set times (i.e.,
+            -6 deg horizon = civil twilight, etc.)
         """
-        raise NotImplementedError()
+        return self.target_rise_time(time, MoonFlag, which, horizon)
+
+    def moon_set_time(self, time, which='nearest', horizon=0*u.deg):
+        """
+        Returns the local moon set time.
+        Compute time of the next/previous/nearest moon set, where
+        moon set is defined as the time when the moon transitions from
+        altitudes below ``horizon`` to above ``horizon``.
+        Parameters
+        ----------
+        time : `~astropy.time.Time` or other (see below)
+            Time of observation. This will be passed in as the first argument to
+            the `~astropy.time.Time` initializer, so it can be anything that
+            `~astropy.time.Time` will accept (including a `~astropy.time.Time`
+            object).
+        which : {'next', 'previous', 'nearest'}
+            Choose which moon set relative to the present ``time`` would you
+            like to calculate.
+        horizon : `~astropy.units.Quantity` (optional), default = zero degrees
+            Degrees above/below actual horizon to use
+            for calculating set/set times (i.e.,
+            -6 deg horizon = civil twilight, etc.)
+        """
+        return self.target_set_time(time, MoonFlag, which, horizon)
 
     def moon_illumination(self, time):
         """
         Calculate the illuminated fraction of the moon.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1379,25 +1281,14 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
-        moon : `~astropy.coordinates.SkyCoord` or `None` (default)
-            Position of the moon at time ``time``. If `None`, will calculate
-            the position of the moon with `~astroplan.get_moon`.
-
-        sun : `~astropy.coordinates.SkyCoord` or `None` (default)
-            Position of the sun at time ``time``. If `None`, will calculate
-            the position of the Sun with `~astropy.coordinates.get_sun`.
-
         Returns
         -------
         float
             Fraction of lunar surface illuminated
-
         Examples
         --------
         How much of the lunar surface is illuminated at 2015-08-29 18:35 UTC,
         which we happen to know is the time of a full moon?
-
         >>> from astroplan import Observer
         >>> from astropy.time import Time
         >>> apo = Observer.at_site("APO")
@@ -1408,14 +1299,12 @@ class Observer(object):
         if not isinstance(time, Time):
             time = Time(time)
 
-        return moon_illumination(time, self.location)
+        return moon_illumination(time)
 
-    def moon_phase(self, time=None, moon=None, sun=None):
+    def moon_phase(self, time=None):
         """
         Calculate lunar orbital phase.
-
         For example, phase=2*pi is "new", phase=0 is "full".
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1423,26 +1312,15 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
-        moon : `~astropy.coordinates.SkyCoord` or `None` (default)
-            Position of the moon at time ``time``. If `None`, will calculate
-            the position of the moon with `~astroplan.get_moon`.
-
-        sun : `~astropy.coordinates.SkyCoord` or `None` (default)
-            Position of the sun at time ``time``. If `None`, will calculate
-            the position of the Sun with `~astropy.coordinates.get_sun`.
-
         Returns
         -------
         moon_phase_angle : float
             Orbital phase angle of the moon where 2*pi corresponds to new moon,
             zero corresponds to full moon.
-
         Examples
         --------
         Calculate the phase of the moon at 2015-08-29 18:35 UTC. Near zero
         radians corresponds to a nearly full moon.
-
         >>> from astroplan import Observer
         >>> from astropy.time import Time
         >>> apo = Observer.at_site('APO')
@@ -1453,15 +1331,11 @@ class Observer(object):
         if time is not None and not isinstance(time, Time):
             time = Time(time)
 
-        return moon_phase_angle(time, self.location)
+        return moon_phase_angle(time)
 
-    def moon_altaz(self, time):
+    def moon_altaz(self, time, ephemeris=None):
         """
         Returns the position of the moon in alt/az.
-
-        TODO: Currently `moon_altaz` uses PyEphem to calculate the position
-        of the moon.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1469,63 +1343,62 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object).
-
+        ephemeris : str, optional
+            Ephemeris to use.  If not given, use the one set with
+            ``astropy.coordinates.solar_system_ephemeris.set`` (which is
+            set to 'builtin' by default).
         Returns
         -------
         altaz : `~astropy.coordinates.SkyCoord`
             Position of the moon transformed to altitude and azimuth
-
         Examples
         --------
         Calculate the altitude and azimuth of the moon at Apache Point
         Observatory:
-
         >>> from astroplan import Observer
         >>> from astropy.time import Time
         >>> apo = Observer.at_site("APO")
         >>> time = Time("2015-08-29 18:35")
-        >>> altaz_moon = apo.moon_altaz(time)
-        >>> print("alt: {0.alt}, az: {0.az}".format(altaz_moon)) # doctest: +FLOAT_CMP
-        alt: -64.1659594407 deg, az: 345.360401117 deg
+        >>> altaz_moon = apo.moon_altaz(time) # doctest: +SKIP
+        >>> print("alt: {0.alt}, az: {0.az}".format(altaz_moon)) # doctest: +SKIP
+        alt: -63.72706397691421 deg, az: 345.3640380598265 deg
         """
         if not isinstance(time, Time):
             time = Time(time)
 
-        try:
-            import ephem
-        except ImportError:
-            raise ImportError("The moon_altaz function currently requires "
-                              "PyEphem to compute the position of the moon.")
+        moon = get_moon(time, location=self.location, ephemeris=ephemeris)
+        return self.altaz(time, moon)
 
-        moon = ephem.Moon()
-        obs = ephem.Observer()
-        obs.lat = self.location.latitude.to(u.degree).to_string(sep=':')
-        obs.lon = self.location.longitude.to(u.degree).to_string(sep=':')
-        obs.elevation = self.location.height.to(u.m).value
-        if self.pressure is not None:
-            obs.pressure = self.pressure.to(u.bar).value*1000.0
+    def sun_altaz(self, time):
+        """
+        Returns the position of the Sun in alt/az.
+        Parameters
+        ----------
+        time : `~astropy.time.Time` or other (see below)
+            This will be passed in as the first argument to
+            the `~astropy.time.Time` initializer, so it can be anything that
+            `~astropy.time.Time` will accept (including a `~astropy.time.Time`
+            object).
+        ephemeris : str, optional
+            Ephemeris to use.  If not given, use the one set with
+            ``astropy.coordinates.solar_system_ephemeris.set`` (which is
+            set to 'builtin' by default).
+        Returns
+        -------
+        altaz : `~astropy.coordinates.SkyCoord`
+            Position of the sun transformed to altitude and azimuth
+        """
+        if not isinstance(time, Time):
+            time = Time(time)
 
-        if time.isscalar:
-            obs.date = time.datetime
-            moon.compute(obs)
-            moon_alt = float(moon.alt)
-            moon_az = float(moon.az)
-        else:
-            moon_alt = []
-            moon_az = []
-            for t in time:
-                obs.date = t.datetime
-                moon.compute(obs)
-                moon_alt.append(float(moon.alt))
-                moon_az.append(float(moon.az))
-        return SkyCoord(alt=moon_alt*u.rad, az=moon_az*u.rad,
-                        frame=self.altaz(time))
+        sun = get_sun(time)
+        return self.altaz(time, sun)
 
     @u.quantity_input(horizon=u.deg)
-    def target_is_up(self, time, target, horizon=0*u.degree, return_altaz=False):
+    def target_is_up(self, time, target, horizon=0*u.degree,
+                     return_altaz=False, grid_times_targets=False):
         """
         Is ``target`` above ``horizon`` at this ``time``?
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1533,47 +1406,46 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object)
-
-        target : coordinate object (i.e. `~astropy.coordinates.SkyCoord`, `~astroplan.FixedTarget`) or list
+        target : `~astropy.coordinates.SkyCoord`, `~astroplan.FixedTarget`, or list
             Target celestial object(s)
-
         horizon : `~astropy.units.Quantity` (optional), default = zero degrees
             Degrees above/below actual horizon to use
             for calculating rise/set times (i.e.,
             -6 deg horizon = civil twilight, etc.)
-
         return_altaz : bool (optional)
             Also return the '~astropy.coordinates.AltAz' coordinate.
-
+        grid_times_targets: bool
+            If True, the target object will have extra dimensions packed
+            onto the end, so that calculations with M targets and N times
+            will return an (M, N) shaped result. Otherwise, we rely on
+            broadcasting the shapes together using standard numpy rules.
         Returns
         -------
-        observable : boolean
+        observable : boolean or np.ndarray(bool)
             True if ``target`` is above ``horizon`` at ``time``, else False.
-
         Examples
         --------
         Are Aldebaran and Vega above the horizon at Apache Point Observatory
         at 2015-08-29 18:35 UTC?
-
         >>> from astroplan import Observer, FixedTarget
         >>> from astropy.time import Time
         >>> apo = Observer.at_site("APO")
         >>> time = Time("2015-08-29 18:35")
         >>> aldebaran = FixedTarget.from_name("Aldebaran")
         >>> vega = FixedTarget.from_name("Vega")
-        >>> apo.target_is_up(time, aldebaran)
+        >>> apo.target_is_up(time, aldebaran) # doctest: +SKIP
         True
-        >>> apo.target_is_up(time, [aldebaran, vega])
-        [True, False]
+        >>> apo.target_is_up(time, [aldebaran, vega]) # doctest: +SKIP
+        array([ True, False], dtype=bool)
         """
         if not isinstance(time, Time):
             time = Time(time)
 
-        altaz = self.altaz(time, target)
-        if _target_is_vector(target):
-            observable = [bool(alt > horizon) for alt in altaz.alt]
-        else:
-            observable = bool(altaz.alt > horizon)
+        altaz = self.altaz(time, target, grid_times_targets=grid_times_targets)
+        observable = altaz.alt > horizon
+
+        if altaz.isscalar:
+            observable = bool(observable)
 
         if not return_altaz:
             return observable
@@ -1584,7 +1456,6 @@ class Observer(object):
     def is_night(self, time, horizon=0*u.deg, obswl=None):
         """
         Is the Sun below ``horizon`` at ``time``?
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1592,45 +1463,42 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object)
-
         horizon : `~astropy.units.Quantity` (optional), default = zero degrees
             Degrees above/below actual horizon to use
             for calculating day/night (i.e.,
             -6 deg horizon = civil twilight, etc.)
-
         obswl : `~astropy.units.Quantity` (optional)
             Wavelength of the observation used in the calculation
-
         Returns
         -------
-        sun_below_horizon : bool
+        sun_below_horizon : bool or np.ndarray(bool)
             `True` if sun is below ``horizon`` at ``time``, else `False`.
-
         Examples
         --------
         Is it "nighttime" (i.e. is the Sun below ``horizon``) at Apache Point
         Observatory at 2015-08-29 18:35 UTC?
-
         >>> from astroplan import Observer
         >>> from astropy.time import Time
         >>> apo = Observer.at_site("APO")
         >>> time = Time("2015-08-29 18:35")
-        >>> apo.is_night(time)
+        >>> apo.is_night(time) # doctest: +SKIP
         False
         """
         if not isinstance(time, Time):
             time = Time(time)
 
         solar_altitude = self.altaz(time, target=get_sun(time), obswl=obswl).alt
-        return bool(solar_altitude < horizon)
+
+        if solar_altitude.isscalar:
+            return bool(solar_altitude < horizon)
+        else:
+            return solar_altitude < horizon
 
     def local_sidereal_time(self, time, kind='apparent', model=None):
         """
         Convert ``time`` to local sidereal time for observer.
-
         This is a thin wrapper around the `~astropy.time.Time.sidereal_time`
         method.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1638,15 +1506,12 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object)
-
         kind : {'mean', 'apparent'} (optional)
             Passed to the ``kind`` argument of
             `~astropy.time.Time.sidereal_time`
-
         model : str or `None`; optional
             The precession/nutation model to assume - see
             `~astropy.time.Time.sidereal_time` for more details.
-
         Returns
         -------
         `~astropy.coordinates.Longitude`
@@ -1655,13 +1520,12 @@ class Observer(object):
         if not isinstance(time, Time):
             time = Time(time)
 
-        return time.sidereal_time(kind, longitude=self.location.longitude,
+        return time.sidereal_time(kind, longitude=self.location.lon,
                                   model=model)
 
-    def target_hour_angle(self, time, target):
+    def target_hour_angle(self, time, target, grid_times_targets=False):
         """
         Calculate the local hour angle of ``target`` at ``time``.
-
         Parameters
         ----------
         time : `~astropy.time.Time` or other (see below)
@@ -1669,27 +1533,52 @@ class Observer(object):
             the `~astropy.time.Time` initializer, so it can be anything that
             `~astropy.time.Time` will accept (including a `~astropy.time.Time`
             object)
-
-        target : coordinate object (i.e. `~astropy.coordinates.SkyCoord`, `~astroplan.FixedTarget`) or list
+        target : `~astropy.coordinates.SkyCoord`, `~astroplan.FixedTarget`, or list
             Target celestial object(s)
-
+        grid_times_targets: bool
+            If True, the target object will have extra dimensions packed
+            onto the end, so that calculations with M targets and N times
+            will return an (M, N) shaped result. Otherwise, we rely on
+            broadcasting the shapes together using standard numpy rules.
         Returns
         -------
         hour_angle : `~astropy.coordinates.Angle`
             The hour angle(s) of the target(s) at ``time``
         """
-        if not isinstance(time, Time):
-            time = Time(time)
+        time, target = self._preprocess_inputs(time, target, grid_times_targets)
+        return Longitude(self.local_sidereal_time(time) - target.ra)
 
-        if _target_is_vector(target):
-            coords = [t.coord if hasattr(t, 'coord') else t
-                      for t in target]
+    @u.quantity_input(horizon=u.degree)
+    def tonight(self, time=None, horizon=0 * u.degree, obswl=None):
+        """
+        Return a time range corresponding to the nearest night
+        This will return a range of `~astropy.time.Time` corresponding to the
+        beginning and ending of the night. If in the middle of a given night,
+        return times from `~astropy.time.Time.now` until the nearest
+        `~astroplan.Observer.sun_rise_time`
+        Parameters
+        ----------
+        time : `~astropy.time.Time` (optional), default = `~astropy.time.Time.now`
+            The start time for tonight, which is allowed to be arbitrary. See description
+            above for behavior
+        horizon : `~astropy.units.Quantity` (optional), default = zero degrees
+            Degrees above/below actual horizon to use for calculating rise/set times
+            (e.g., -6 deg horizon = civil twilight, etc.)
+        obswl : `~astropy.units.Quantity` (optional)
+            Wavelength of the observation used in the calculation
+        Returns
+        -------
+        times : `~astropy.time.Time`
+            A tuple of times corresponding to the start and end of current night
+        """
+        current_time = Time.now() if time is None else time
+        night_mask = self.is_night(current_time, horizon=horizon, obswl=obswl)
+        sun_set_time = self.sun_set_time(current_time, which='next', horizon=horizon)
 
-            hour_angle = Longitude([self.local_sidereal_time(time) - coord.ra
-                                    for coord in coords])
+        start_time = np.where(night_mask, current_time, sun_set_time)
+        # np.where gives us a list of start Times - convert to Time object
+        if not isinstance(start_time, Time):
+            start_time = Time(start_time)
+        end_time = self.sun_rise_time(start_time, which='next', horizon=horizon)
 
-        else:
-            coord = target.coord if hasattr(target, 'coord') else target
-            hour_angle = Longitude(self.local_sidereal_time(time) - coord.ra)
-
-        return hour_angle
+        return start_time, end_time
